@@ -1,0 +1,356 @@
+
+import json
+import logging
+import os
+import threading
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+import paho.mqtt.client as mqtt
+import psycopg
+from fastapi import FastAPI, HTTPException
+from psycopg.rows import dict_row
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("devicepulse")
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+MQTT_HOST = os.getenv("MQTT_HOST", "test.mosquitto.org")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_TOPIC = os.getenv(
+    "MQTT_TOPIC", "devicepulse/kiosk/heartbeat"
+)
+
+mqtt_client = None
+mqtt_thread_lock = threading.Lock()
+
+
+def get_db():
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=5,
+    )
+
+
+def initialize_database():
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS heartbeat_events (
+                id BIGSERIAL PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                heartbeat_sequence BIGINT,
+                device_timestamp TIMESTAMPTZ,
+                received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                mqtt_connected BOOLEAN,
+                mqtt_connection_status TEXT,
+                overall_status TEXT,
+                consecutive_publish_failures INTEGER,
+                last_error_code TEXT,
+                payload JSONB NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_heartbeat_device_received
+            ON heartbeat_events (device_id, received_at DESC)
+        """)
+        conn.commit()
+    logger.info("Database initialized")
+
+
+def parse_timestamp(value):
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except (ValueError, TypeError):
+        return None
+
+
+def save_heartbeat(payload):
+    device_id = payload.get("deviceId")
+    if not isinstance(device_id, str) or not device_id.strip():
+        raise ValueError("Missing or invalid deviceId")
+
+    device = payload.get("device") or {}
+    network = payload.get("network") or {}
+    health = payload.get("health") or {}
+
+    timestamp = parse_timestamp(payload.get("timestamp"))
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO heartbeat_events (
+                device_id,
+                heartbeat_sequence,
+                device_timestamp,
+                mqtt_connected,
+                mqtt_connection_status,
+                overall_status,
+                consecutive_publish_failures,
+                last_error_code,
+                payload
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                device_id,
+                payload.get("heartbeatSequence"),
+                timestamp,
+                network.get("mqttConnected"),
+                network.get("mqttConnectionStatus"),
+                health.get("overallStatus"),
+                health.get("consecutivePublishFailures"),
+                health.get("lastErrorCode"),
+                json.dumps(payload),
+            ),
+        )
+        conn.commit()
+
+    logger.info(
+        "Saved heartbeat: device=%s sequence=%s status=%s",
+        device_id,
+        payload.get("heartbeatSequence"),
+        health.get("overallStatus"),
+    )
+
+
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code.is_failure:
+        logger.error("MQTT connection failed: %s", reason_code)
+        return
+
+    logger.info("Connected to MQTT broker %s:%s", MQTT_HOST, MQTT_PORT)
+    client.subscribe(MQTT_TOPIC, qos=0)
+    logger.info("Subscribed to %s", MQTT_TOPIC)
+
+
+def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+    logger.warning("MQTT disconnected: %s", reason_code)
+
+
+def on_message(client, userdata, message):
+    try:
+        payload = json.loads(message.payload.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Heartbeat must be a JSON object")
+        save_heartbeat(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        logger.exception("Invalid heartbeat on topic %s", message.topic)
+    except Exception:
+        logger.exception("Failed to save heartbeat")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global mqtt_client
+
+    initialize_database()
+
+    with mqtt_thread_lock:
+        mqtt_client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id="devicepulse-backend-mvp",
+            protocol=mqtt.MQTTv311,
+        )
+        mqtt_client.on_connect = on_connect
+        mqtt_client.on_disconnect = on_disconnect
+        mqtt_client.on_message = on_message
+        mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
+        mqtt_client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
+        mqtt_client.loop_start()
+
+    yield
+
+    with mqtt_thread_lock:
+        if mqtt_client is not None:
+            mqtt_client.disconnect()
+            mqtt_client.loop_stop()
+            mqtt_client = None
+
+
+app = FastAPI(
+    title="DevicePulse Backend",
+    version="0.2.0",
+    description="MQTT heartbeat ingestion and storage for DevicePulse.",
+    lifespan=lifespan,
+)
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "devicepulse-backend",
+        "mqtt_broker": f"{MQTT_HOST}:{MQTT_PORT}",
+        "mqtt_topic": MQTT_TOPIC,
+        "mqtt_ingestion": "enabled",
+        "database_persistence": "enabled",
+    }
+
+
+@app.get("/devices")
+def list_devices():
+    try:
+        with get_db() as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT ON (device_id)
+                    device_id,
+                    heartbeat_sequence,
+                    device_timestamp,
+                    received_at,
+                    mqtt_connected,
+                    mqtt_connection_status,
+                    overall_status,
+                    consecutive_publish_failures,
+                    last_error_code,
+                    payload
+                FROM heartbeat_events
+                ORDER BY device_id, received_at DESC, id DESC
+            """).fetchall()
+        return {"count": len(rows), "devices": rows}
+    except Exception:
+        logger.exception("Failed to list devices")
+        raise HTTPException(
+            status_code=503, detail="Device database unavailable"
+        )
+
+
+@app.get("/devices/{device_id}/heartbeats")
+def device_heartbeats(device_id: str, limit: int = 20):
+    if limit < 1 or limit > 200:
+        raise HTTPException(
+            status_code=400, detail="limit must be between 1 and 200"
+        )
+
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, device_id, heartbeat_sequence,
+                       device_timestamp, received_at, mqtt_connected,
+                       mqtt_connection_status, overall_status,
+                       consecutive_publish_failures, last_error_code,
+                       payload
+                FROM heartbeat_events
+                WHERE device_id = %s
+                ORDER BY received_at DESC, id DESC
+                LIMIT %s
+                """,
+                (device_id, limit),
+            ).fetchall()
+        return {"deviceId": device_id, "count": len(rows), "heartbeats": rows}
+    except Exception:
+        logger.exception("Failed to query heartbeats")
+        raise HTTPException(
+            status_code=503, detail="Heartbeat database unavailable"
+        )
+
+
+@app.get("/heartbeats/recent")
+def recent_heartbeats(limit: int = 50):
+    if limit < 1 or limit > 200:
+        raise HTTPException(
+            status_code=400, detail="limit must be between 1 and 200"
+        )
+
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, device_id, heartbeat_sequence,
+                       device_timestamp, received_at,
+                       mqtt_connected, mqtt_connection_status,
+                       overall_status, consecutive_publish_failures,
+                       last_error_code
+                FROM heartbeat_events
+                ORDER BY received_at DESC, id DESC
+                LIMIT %s
+                """,
+                (limit,),
+            ).fetchall()
+        return {"count": len(rows), "heartbeats": rows}
+    except Exception:
+        logger.exception("Failed to query recent heartbeats")
+        raise HTTPException(
+            status_code=503, detail="Heartbeat database unavailable"
+        )
+
+
+@app.get("/devices/status")
+def device_status():
+    """Calculate device connectivity from the last backend receipt time."""
+    now = datetime.now(timezone.utc)
+
+    try:
+        with get_db() as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT ON (device_id)
+                    device_id,
+                    heartbeat_sequence,
+                    received_at,
+                    mqtt_connected,
+                    mqtt_connection_status,
+                    overall_status,
+                    last_error_code
+                FROM heartbeat_events
+                ORDER BY device_id, received_at DESC, id DESC
+            """).fetchall()
+
+        devices = []
+
+        for row in rows:
+            received_at = row["received_at"]
+
+            if received_at.tzinfo is None:
+                received_at = received_at.replace(tzinfo=timezone.utc)
+
+            age_seconds = max(
+                0, int((now - received_at).total_seconds())
+            )
+
+            if age_seconds >= 180:
+                status = "offline"
+            elif age_seconds >= 120:
+                status = "suspect"
+            else:
+                status = "online"
+
+            devices.append({
+                "deviceId": row["device_id"],
+                "status": status,
+                "lastSeen": received_at.isoformat(),
+                "secondsSinceLastHeartbeat": age_seconds,
+                "heartbeatSequence": row["heartbeat_sequence"],
+                "mqttConnectedAtLastHeartbeat": row["mqtt_connected"],
+                "mqttConnectionStatusAtLastHeartbeat":
+                    row["mqtt_connection_status"],
+                "reportedHealth": row["overall_status"],
+                "lastErrorCode": row["last_error_code"],
+            })
+
+        return {
+            "count": len(devices),
+            "thresholdsSeconds": {
+                "suspect": 120,
+                "offline": 180,
+            },
+            "devices": devices,
+        }
+
+    except Exception:
+        logger.exception("Failed to calculate device status")
+        raise HTTPException(
+            status_code=503,
+            detail="Device status unavailable",
+        )

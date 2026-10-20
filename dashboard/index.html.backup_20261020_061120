@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DevicePulse Dashboard</title>
+<style>
+:root{font-family:Segoe UI,Arial,sans-serif;color:#e8edf6;background:#0b1120;color-scheme:dark}
+*{box-sizing:border-box}body{margin:0}
+header{padding:22px 28px;border-bottom:1px solid #253047;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+h1{margin:0;font-size:26px}h2{font-size:18px}.muted{color:#9aa8bf;font-size:13px}
+main{max-width:1400px;margin:auto;padding:24px}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:20px}
+.panel,.metric{background:#131d30;border:1px solid #253047;border-radius:12px;padding:18px;min-width:0}
+.metric strong{display:block;font-size:32px;margin-top:8px}
+.online{color:#4ade80}.suspect{color:#fbbf24}.offline{color:#fb7185}
+.status{display:inline-block;padding:5px 10px;border-radius:20px;background:#263247;font-size:11px;font-weight:bold;text-transform:uppercase}
+.toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+button{cursor:pointer;border:1px solid #3a4a65;border-radius:8px;background:#22314a;color:white;padding:10px 14px}
+.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:760px}
+th,td{text-align:left;padding:12px 10px;border-bottom:1px solid #253047;font-size:13px}
+th{color:#9aa8bf}td{overflow-wrap:anywhere}.error{color:#fb7185}
+@media(max-width:650px){main{padding:12px}.grid{gap:8px}.metric{padding:12px}.metric strong{font-size:24px}}
+nav{display:flex;gap:8px;padding:12px 28px;border-bottom:1px solid #253047}
+nav button.active{background:#38527a;border-color:#6d8fca}
+.hidden{display:none!important}
+.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.field{display:flex;flex-direction:column;gap:6px;margin:8px 0}
+.field label{font-size:13px;color:#9aa8bf}
+.field input,.field select{width:100%;padding:10px;border:1px solid #3a4a65;border-radius:8px;background:#0b1120;color:#e8edf6}
+.channel{border:1px solid #253047;border-radius:12px;padding:16px;margin:16px 0}
+.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.notice{padding:10px;border-radius:8px;margin:10px 0;background:#1b2b43}
+@media(max-width:650px){.form-grid{grid-template-columns:1fr}nav{padding:12px}}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>DevicePulse</h1><div class="muted">Device health and heartbeat monitoring</div></div>
+  <div><div id="connection" class="muted">Connecting...</div><div id="updated" class="muted"></div></div>
+</header>
+<nav>
+  <button id="overviewNav" class="active" type="button">Overview</button>
+  <button id="settingsNav" type="button">Settings</button>
+  <button id="monitoringNav" type="button">Monitoring Rules</button>
+</nav>
+<main>
+<section id="overviewView">
+  <div class="grid">
+    <div class="metric"><span class="muted">Online</span><strong id="onlineCount" class="online">—</strong></div>
+    <div class="metric"><span class="muted">Suspect</span><strong id="suspectCount" class="suspect">—</strong></div>
+    <div class="metric"><span class="muted">Offline</span><strong id="offlineCount" class="offline">—</strong></div>
+  </div>
+  <section class="panel">
+    <div class="toolbar"><div><h2>Devices</h2><div class="muted">Online &lt;120s · Suspect 120–179s · Offline ≥180s</div></div><button id="refresh">Refresh now</button></div>
+    <p id="message" class="muted"></p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Device</th><th>Status</th><th>Last seen</th><th>Age</th><th>Sequence</th><th>MQTT</th><th>Reported health</th><th>Last error</th></tr></thead>
+      <tbody id="devices"><tr><td colspan="8">Loading...</td></tr></tbody>
+    </table></div>
+  </section>
+  <section class="panel" style="margin-top:20px">
+    <h2>Recent heartbeats</h2><div class="table-wrap"><table>
+      <thead><tr><th>Received at</th><th>Device</th><th>Sequence</th><th>MQTT connected</th><th>Health</th><th>Publish failures</th></tr></thead>
+      <tbody id="history"><tr><td colspan="6">Loading...</td></tr></tbody>
+    </table></div>
+  </section>
+</section>
+
+<section id="monitoringView" class="hidden">
+ <section class="panel">
+  <div class="toolbar"><div><h2>Monitoring Rules</h2><div class="muted">Rules evaluate telemetry paths observed in incoming heartbeat JSON. Leave device blank for a global rule.</div></div><button id="loadMonitoring" type="button">Refresh monitoring</button></div>
+  <div id="monitoringNotice" class="notice hidden"></div>
+  <div class="form-grid">
+   <div class="field"><label for="monitorDevice">Device ID (configuration target)</label><input id="monitorDevice" placeholder="Enter exact deviceId"></div>
+   <div class="field"><label for="monitorMode">Evaluation mode</label><select id="monitorMode"><option value="all">All enabled applicable rules</option><option value="custom">Only selected rules</option></select></div>
+  </div>
+  <button id="saveMonitorConfig" type="button">Save device evaluation mode</button>
+  <h3>Create rule</h3>
+  <form id="ruleForm">
+   <div class="form-grid">
+    <div class="field"><label for="ruleName">Rule name</label><input id="ruleName" required maxlength="120" placeholder="Battery level low"></div>
+    <div class="field"><label for="ruleDevice">Device ID (blank = all devices)</label><input id="ruleDevice" placeholder="Optional deviceId"></div>
+    <div class="field"><label for="rulePath">Telemetry parameter path</label><input id="rulePath" list="parameterOptions" required placeholder="battery.percent"><datalist id="parameterOptions"></datalist></div>
+    <div class="field"><label for="ruleOperator">Condition</label><select id="ruleOperator"><option value="lt">Less than</option><option value="lte">Less than or equal</option><option value="gt">Greater than</option><option value="gte">Greater than or equal</option><option value="eq">Equals</option><option value="ne">Not equal</option><option value="contains">Contains text</option><option value="is_true">Is true</option><option value="is_false">Is false</option><option value="exists">Exists (expected ignored; parameter must be present)</option></select></div>
+    <div class="field"><label for="ruleExpected">Expected value</label><input id="ruleExpected" placeholder="20"></div>
+    <div class="field"><label for="ruleDuration">Duration before alert (seconds)</label><input id="ruleDuration" type="number" min="0" max="86400" value="0"></div>
+    <div class="field"><label for="ruleSeverity">Severity</label><select id="ruleSeverity"><option value="info">Info</option><option value="warning" selected>Warning</option><option value="critical">Critical</option></select></div>
+   </div><button type="submit">Create monitoring rule</button>
+  </form>
+  <h3>Rules</h3><div class="table-wrap"><table><thead><tr><th>Custom select</th><th>ID</th><th>Scope</th><th>Name</th><th>Parameter</th><th>Condition</th><th>Duration</th><th>Severity</th><th>Enabled</th><th>Action</th></tr></thead><tbody id="monitorRules"><tr><td colspan="10">Sign in under Settings, then refresh.</td></tr></tbody></table></div>
+ </section>
+ <section class="panel" style="margin-top:20px"><div class="toolbar"><h2>Monitoring Alerts</h2><select id="alertFilter"><option value="all">All alerts</option><option value="open">Open</option><option value="resolved">Resolved</option></select></div><div class="table-wrap"><table><thead><tr><th>Status</th><th>Severity</th><th>Device</th><th>Rule / Parameter</th><th>Actual</th><th>Expected</th><th>Started</th><th>Resolved</th><th>Diagnostics</th></tr></thead><tbody id="monitorAlerts"><tr><td colspan="9">No alerts loaded.</td></tr></tbody></table></div></section>
+</section>
+
+<section id="settingsView" class="hidden">
+  <section class="panel">
+    <div class="toolbar"><div><h2>Notification Settings</h2><div class="muted">Credentials are encrypted in the backend database. Secret values are never returned to this page.</div></div><button id="logoutBtn" type="button">Log out</button></div>
+    <div id="settingsNotice" class="notice hidden"></div>
+    <div id="loginPanel">
+      <h2>Administrator login</h2>
+      <form id="loginForm">
+        <div class="form-grid">
+          <div class="field"><label for="loginUsername">Username</label><input id="loginUsername" autocomplete="username" required></div>
+          <div class="field"><label for="loginPassword">Password</label><input id="loginPassword" type="password" autocomplete="current-password" required></div>
+        </div>
+        <button type="submit">Sign in</button>
+      </form>
+    </div>
+    <div id="settingsFormPanel" class="hidden">
+      <form id="settingsForm">
+        <div class="channel">
+          <div class="toolbar"><h2>Email / SMTP</h2><label><input type="checkbox" id="emailEnabled"> Enable email alerts</label></div>
+          <div class="form-grid">
+            <div class="field"><label for="smtpHost">SMTP host</label><input id="smtpHost" placeholder="smtp.example.com"></div>
+            <div class="field"><label for="smtpPort">SMTP port</label><input id="smtpPort" type="number" min="1" max="65535" value="587"></div>
+            <div class="field"><label for="smtpUsername">SMTP username</label><input id="smtpUsername" autocomplete="off"></div>
+            <div class="field"><label for="smtpPassword">SMTP password / app password</label><input id="smtpPassword" type="password" autocomplete="new-password" placeholder="Leave blank to keep saved password"></div>
+            <div class="field"><label for="emailFrom">From address</label><input id="emailFrom" type="email"></div>
+            <div class="field"><label for="emailTo">Recipient address</label><input id="emailTo" type="email"></div>
+          </div>
+          <label><input type="checkbox" id="smtpStarttls" checked> Use STARTTLS</label>
+          <div class="actions"><button type="button" data-test="email">Send test email</button><span class="muted" id="emailConfigured"></span></div>
+        </div>
+        <div class="channel">
+          <div class="toolbar"><h2>Slack</h2><label><input type="checkbox" id="slackEnabled"> Enable Slack alerts</label></div>
+          <div class="field"><label for="slackWebhook">Incoming webhook URL</label><input id="slackWebhook" type="password" autocomplete="new-password" placeholder="Leave blank to keep saved webhook"></div>
+          <div class="actions"><button type="button" data-test="slack">Send test to Slack</button><span class="muted" id="slackConfigured"></span></div>
+        </div>
+        <div class="channel">
+          <div class="toolbar"><h2>Telegram</h2><label><input type="checkbox" id="telegramEnabled"> Enable Telegram alerts</label></div>
+          <div class="form-grid">
+            <div class="field"><label for="telegramToken">Bot token</label><input id="telegramToken" type="password" autocomplete="new-password" placeholder="Leave blank to keep saved token"></div>
+            <div class="field"><label for="telegramChat">Chat ID</label><input id="telegramChat"></div>
+          </div>
+          <div class="actions"><button type="button" data-test="telegram">Send test to Telegram</button><span class="muted" id="telegramConfigured"></span></div>
+        </div>
+        <div class="actions"><button type="submit">Save settings</button><span class="muted">Save changes before sending a test notification.</span></div>
+      </form>
+    </div>
+  </section>
+</section>
+</main>
+<script>
+const API="http://localhost:8081";
+const $=id=>document.getElementById(id);
+function esc(v){return String(v??"—").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function date(v){if(!v)return "—";const d=new Date(v);return isNaN(d)?"—":d.toLocaleString();}
+function status(s){s=String(s||"unknown").toLowerCase();return `<span class="status ${["online","suspect","offline"].includes(s)?s:""}">${esc(s)}</span>`;}
+async function json(path){const r=await fetch(API+path,{cache:"no-store"});if(!r.ok)throw Error(path+" returned HTTP "+r.status);return r.json();}
+async function refresh(){
+ $("refresh").disabled=true;
+ try{
+  const [s,h]=await Promise.all([json("/devices/status"),json("/heartbeats/recent")]);
+  const ds=s.devices||[];
+  for(const [id,value] of [["onlineCount","online"],["suspectCount","suspect"],["offlineCount","offline"]])$(id).textContent=ds.filter(d=>d.status===value).length;
+  $("devices").innerHTML=ds.length?ds.map(d=>`<tr><td>${esc(d.deviceId)}</td><td>${status(d.status)}</td><td>${date(d.lastSeen)}</td><td>${esc(d.secondsSinceLastHeartbeat)}s</td><td>${esc(d.heartbeatSequence)}</td><td>${esc(d.mqttConnectionStatusAtLastHeartbeat)}</td><td>${esc(d.reportedHealth)}</td><td>${esc(d.lastErrorCode)}</td></tr>`).join(""):'<tr><td colspan="8">No devices received yet</td></tr>';
+  const events=Array.isArray(h)?h:(h.heartbeats||h.items||[]);
+  $("history").innerHTML=events.length?events.map(x=>`<tr><td>${date(x.received_at||x.receivedAt)}</td><td>${esc(x.device_id||x.deviceId)}</td><td>${esc(x.heartbeat_sequence??x.heartbeatSequence)}</td><td>${esc(x.mqtt_connected??x.mqttConnected)}</td><td>${esc(x.overall_status||x.overallStatus)}</td><td>${esc(x.consecutive_publish_failures??x.consecutivePublishFailures)}</td></tr>`).join(""):'<tr><td colspan="6">No history returned. Check the endpoint response.</td></tr>';
+  $("connection").textContent="API connected · "+ds.length+" device(s)";
+  $("updated").textContent="Updated "+new Date().toLocaleTimeString();
+  $("message").textContent="";
+ }catch(e){$("connection").textContent="API unavailable";$("message").textContent=e.message+" — check backend and browser console";$("message").className="error";}
+ finally{$("refresh").disabled=false;}
+}
+$("refresh").onclick=refresh;refresh();setInterval(refresh,10000);
+
+let authToken = null;
+const $s = id => document.getElementById(id);
+function notice(message, isError=false) {
+  const el=$s("settingsNotice");
+  el.textContent=message;
+  el.classList.remove("hidden");
+  el.style.border=isError?"1px solid #fb7185":"1px solid #4ade80";
+}
+async function apiSettings(path, options={}) {
+  const headers={"Content-Type":"application/json",...(options.headers||{})};
+  if(authToken) headers.Authorization="Bearer "+authToken;
+  const response=await fetch(API+path,{...options,headers,cache:"no-store"});
+  let data={};
+  try{data=await response.json()}catch{}
+  if(!response.ok) throw Error(data.detail||("HTTP "+response.status));
+  return data;
+}
+function showView(view) {
+  const settings=view==="settings", monitoring=view==="monitoring";
+  $s("overviewView").classList.toggle("hidden",settings||monitoring);
+  $s("settingsView").classList.toggle("hidden",!settings);
+  $s("monitoringView").classList.toggle("hidden",!monitoring);
+  $s("overviewNav").classList.toggle("active",!settings&&!monitoring);
+  $s("settingsNav").classList.toggle("active",settings);
+  $s("monitoringNav").classList.toggle("active",monitoring);
+}
+function loggedIn(value) {
+  $s("loginPanel").classList.toggle("hidden",value);
+  $s("settingsFormPanel").classList.toggle("hidden",!value);
+  $s("logoutBtn").classList.toggle("hidden",!value);
+}
+async function loadSettings() {
+  const s=await apiSettings("/settings");
+  $s("emailEnabled").checked=s.email.enabled;
+  $s("smtpHost").value=s.email.host||"";
+  $s("smtpPort").value=s.email.port||587;
+  $s("smtpStarttls").checked=s.email.starttls!==false;
+  $s("smtpUsername").value=s.email.username||"";
+  $s("emailFrom").value=s.email.from_addr||"";
+  $s("emailTo").value=s.email.to_addr||"";
+  $s("smtpPassword").value="";
+  $s("slackEnabled").checked=s.slack.enabled;
+  $s("slackWebhook").value="";
+  $s("telegramEnabled").checked=s.telegram.enabled;
+  $s("telegramToken").value="";
+  $s("telegramChat").value=s.telegram.chat_id||"";
+  $s("emailConfigured").textContent=s.email.has_password?"Password saved":(s.email.configured?"Email details saved":"Not configured");
+  $s("slackConfigured").textContent=s.slack.has_webhook?"Webhook saved":"Not configured";
+  $s("telegramConfigured").textContent=s.telegram.has_bot_token?"Bot token saved":(s.telegram.configured?"Telegram details saved":"Not configured");
+}
+$s("overviewNav").onclick=()=>showView("overview");
+$s("settingsNav").onclick=()=>{showView("settings"); if(authToken) loadSettings().catch(e=>notice(e.message,true));};
+$s("loginForm").addEventListener("submit",async e=>{
+  e.preventDefault();
+  try {
+    const data=await apiSettings("/auth/login",{method:"POST",body:JSON.stringify({username:$s("loginUsername").value,password:$s("loginPassword").value})});
+    authToken=data.access_token;
+    $s("loginPassword").value="";
+    loggedIn(true);
+    await loadSettings();
+    notice("Signed in. Settings loaded.");
+  } catch(err){notice(err.message,true);}
+});
+$s("settingsForm").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const body={
+    email:{enabled:$s("emailEnabled").checked,host:$s("smtpHost").value.trim(),port:Number($s("smtpPort").value||587),starttls:$s("smtpStarttls").checked,username:$s("smtpUsername").value.trim(),password:$s("smtpPassword").value,from_addr:$s("emailFrom").value.trim(),to_addr:$s("emailTo").value.trim()},
+    slack:{enabled:$s("slackEnabled").checked,webhook_url:$s("slackWebhook").value.trim()},
+    telegram:{enabled:$s("telegramEnabled").checked,bot_token:$s("telegramToken").value.trim(),chat_id:$s("telegramChat").value.trim()}
+  };
+  try{
+    await apiSettings("/settings",{method:"PUT",body:JSON.stringify(body)});
+    $s("smtpPassword").value="";$s("slackWebhook").value="";$s("telegramToken").value="";
+    await loadSettings();
+    notice("Settings saved securely.");
+  }catch(err){notice(err.message,true);}
+});
+document.querySelectorAll("[data-test]").forEach(btn=>btn.addEventListener("click",async()=>{
+  try{
+    await apiSettings("/settings/test",{method:"POST",body:JSON.stringify({channel:btn.dataset.test})});
+    notice("Test notification sent successfully via "+btn.dataset.test+".");
+  }catch(err){notice(err.message,true);}
+}));
+$s("logoutBtn").onclick=()=>{authToken=null;loggedIn(false);notice("Signed out.");};
+
+function monitorNotice(message,isError=false){const el=$s("monitoringNotice");el.textContent=message;el.classList.remove("hidden");el.style.border=isError?"1px solid #fb7185":"1px solid #4ade80";}
+async function monitorApi(path,options={}){if(!authToken)throw Error("Please sign in from Settings first; monitoring configuration requires administrator login.");return apiSettings(path,options);}
+async function loadMonitoring(){
+ try{
+  const [rr,pp,aa]=await Promise.all([monitorApi("/monitoring/rules"),json("/monitoring/parameters"),json("/monitoring/alerts?status="+encodeURIComponent($s("alertFilter").value))]);
+  const params=pp.parameters||[];$s("parameterOptions").innerHTML=params.map(x=>`<option value="${esc(x.path)}">${esc(x.type)} · ${esc(JSON.stringify(x.value))}</option>`).join("");
+  const rules=rr.rules||[];
+  $s("monitorRules").innerHTML=rules.length?rules.map(r=>`<tr><td><input type="checkbox" class="rulePick" value="${r.id}" aria-label="Select rule ${r.id}"></td><td>${r.id}</td><td>${esc(r.device_id||"All devices")}</td><td>${esc(r.name)}</td><td>${esc(r.parameter_path)}</td><td>${esc(r.operator)} ${esc(r.expected_value)}</td><td>${r.duration_seconds}s</td><td>${esc(r.severity)}</td><td>${r.enabled?"Yes":"No"}</td><td><button type="button" data-delete-rule="${r.id}">Delete</button></td></tr>`).join(""):'<tr><td colspan="10">No rules created. Create a rule above.</td></tr>';
+  $s("monitorAlerts").innerHTML=(aa.alerts||[]).length?aa.alerts.map(a=>`<tr><td>${esc(a.status)}</td><td>${esc(a.severity)}</td><td>${esc(a.device_id)}</td><td>${esc(a.rule_name)}<br><span class="muted">${esc(a.parameter_path)}</span></td><td>${esc(a.actual_value)}</td><td>${esc(a.operator)} ${esc(a.expected_value)}</td><td>${date(a.started_at)}</td><td>${date(a.resolved_at)}</td><td>${esc(JSON.stringify(a.diagnostics||{}))}</td></tr>`).join(""):'<tr><td colspan="9">No matching alerts.</td></tr>';
+  const dev=$s("monitorDevice").value.trim();if(dev){try{const cfg=await monitorApi("/monitoring/config?device_id="+encodeURIComponent(dev));$s("monitorMode").value=cfg.mode||"all";document.querySelectorAll(".rulePick").forEach(c=>c.checked=(cfg.selected_rule_ids||[]).includes(Number(c.value)));}catch(e){}}
+  document.querySelectorAll("[data-delete-rule]").forEach(b=>b.onclick=async()=>{if(!confirm("Delete this monitoring rule? Existing alerts are retained."))return;try{await monitorApi("/monitoring/rules/"+b.dataset.deleteRule,{method:"DELETE"});await loadMonitoring();monitorNotice("Rule deleted.");}catch(e){monitorNotice(e.message,true);}});
+  if(!params.length)monitorNotice(pp.message||"No telemetry parameters available yet. Wait for a device heartbeat.",true);else monitorNotice("Rules and alerts loaded. Select a parameter path from observed telemetry.");
+ }catch(e){monitorNotice(e.message,true);}
+}
+$s("monitoringNav").onclick=()=>{showView("monitoring");loadMonitoring();};
+$s("loadMonitoring").onclick=loadMonitoring;$s("alertFilter").onchange=loadMonitoring;
+$s("ruleForm").addEventListener("submit",async e=>{e.preventDefault();const body={name:$s("ruleName").value.trim(),device_id:$s("ruleDevice").value.trim()||null,parameter_path:$s("rulePath").value.trim(),operator:$s("ruleOperator").value,expected_value:$s("ruleExpected").value,duration_seconds:Number($s("ruleDuration").value||0),severity:$s("ruleSeverity").value,enabled:true};try{await monitorApi("/monitoring/rules",{method:"POST",body:JSON.stringify(body)});$s("ruleForm").reset();$s("ruleDuration").value=0;await loadMonitoring();monitorNotice("Rule created.");}catch(err){monitorNotice(err.message,true);}});
+$s("saveMonitorConfig").onclick=async()=>{const device_id=$s("monitorDevice").value.trim();if(!device_id){monitorNotice("Enter a device ID to save its evaluation mode.",true);return;}const selected_rule_ids=[...document.querySelectorAll(".rulePick:checked")].map(x=>Number(x.value));try{await monitorApi("/monitoring/config",{method:"PUT",body:JSON.stringify({device_id,mode:$s("monitorMode").value,selected_rule_ids})});monitorNotice("Evaluation mode saved for "+device_id+".");}catch(e){monitorNotice(e.message,true);}};
+
+loggedIn(false);
+
+</script>
+</body>
+</html>

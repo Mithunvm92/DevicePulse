@@ -1,0 +1,5 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+psycopg[binary]==3.2.6
+paho-mqtt==2.1.0
+cryptography==44.0.2

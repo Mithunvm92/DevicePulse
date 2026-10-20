@@ -1,0 +1,52 @@
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+secrets/
+credentials/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Node.js
+node_modules/
+dist/
+coverage/
+
+# Build artifacts
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+
+# Logs and temporary files
+*.log
+logs/
+tmp/
+temp/
+
+# Local databases and backups
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.backup
+backup_*/
+backups/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
